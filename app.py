@@ -4,14 +4,10 @@ import requests
 import streamlit as st
 
 st.set_page_config(
-    page_title="BTC/USDT PREDICTOR PRO",
+    page_title="BTC/USDT PANEL PRO",
     page_icon="₿",
     layout="wide",
 )
-
-MIN_SPREAD_PCT = 0.015
-FLAT_SPREAD_PCT = 0.005
-MIN_VOL_RATIO = 1.05
 
 
 def to_float(val, default=0.0):
@@ -21,8 +17,8 @@ def to_float(val, default=0.0):
     return default if (np.isnan(num) or np.isinf(num)) else num
 
 
-@st.cache_data(ttl=3, show_spinner=False)
-def fetch_klines(symbol="BTCUSDT", interval="5m", limit=350):
+@st.cache_data(ttl=2, show_spinner=False)
+def fetch_klines(symbol="BTCUSDT", interval="5m", limit=250):
     endpoints = [
         "https://data-api.binance.vision/api/v3/klines",
         "https://api1.binance.com/api/v3/klines",
@@ -42,280 +38,235 @@ def fetch_klines(symbol="BTCUSDT", interval="5m", limit=350):
                 last_error = f"HTTP 451 en {url}"
                 continue
             resp.raise_for_status()
-            data = resp.json()
-            if isinstance(data, list) and len(data) > 0:
+            payload = resp.json()
+            if isinstance(payload, list) and len(payload) > 0:
                 cols = [
                     "open_time", "open", "high", "low", "close", "volume",
                     "close_time", "quote_volume", "trades",
                     "taker_buy_base", "taker_buy_quote", "ignore",
                 ]
-                df = pd.DataFrame(data, columns=cols)
+                df = pd.DataFrame(payload, columns=cols)
                 for c in ["open", "high", "low", "close", "volume"]:
                     df[c] = pd.to_numeric(df[c], errors="coerce")
                 df["close_time_ms"] = pd.to_numeric(df["close_time"], errors="coerce")
                 df = df.dropna(subset=["open", "high", "low", "close", "volume", "close_time_ms"])
                 df = df[df["close"] > 0].reset_index(drop=True)
-                if len(df) >= 35:
+                if len(df) >= 30:
                     return df
         except Exception as exc:
             last_error = f"{url}: {exc}"
 
-    raise RuntimeError(f"No se pudieron obtener velas de Binance ({last_error})")
+    raise RuntimeError(f"Sin conexión con Binance ({last_error})")
 
 
-def add_indicators(df):
+def analyze_intracandle(df):
     d = df.copy()
     d["EMA9"] = d["close"].ewm(span=9, adjust=False).mean()
     d["EMA21"] = d["close"].ewm(span=21, adjust=False).mean()
-
-    delta = d["close"].diff()
-    gain = delta.clip(lower=0.0)
-    loss = (-delta).clip(lower=0.0)
-
-    avg_gain = gain.ewm(alpha=1.0 / 14.0, adjust=False, min_periods=14).mean()
-    avg_loss = loss.ewm(alpha=1.0 / 14.0, adjust=False, min_periods=14).mean()
-
-    rs = avg_gain / avg_loss.replace(0.0, np.nan)
-    rsi = 100.0 - (100.0 / (1.0 + rs))
-    rsi = rsi.where(avg_loss > 0.0, 100.0)
-    rsi = rsi.where(~((avg_gain == 0.0) & (avg_loss == 0.0)), 50.0)
-    d["RSI"] = rsi
-
-    ema12 = d["close"].ewm(span=12, adjust=False).mean()
-    ema26 = d["close"].ewm(span=26, adjust=False).mean()
-    macd = ema12 - ema26
-    macd_sig = macd.ewm(span=9, adjust=False).mean()
-    d["MACD_hist"] = macd - macd_sig
-
     d["VOL_AVG"] = d["volume"].rolling(20, min_periods=1).mean()
-    return d
 
+    prev_closed = d.iloc[-2]
+    live = d.iloc[-1]
 
-def score_candle(candle, prev):
-    close_p = to_float(candle["close"])
-    ema9 = to_float(candle["EMA9"], close_p)
-    ema21 = to_float(candle["EMA21"], close_p)
-    vol = to_float(candle["volume"])
-    vol_avg = to_float(candle["VOL_AVG"])
-    rsi = to_float(candle["RSI"], 50.0)
-    hist = to_float(candle["MACD_hist"])
-    prev_hist = to_float(prev["MACD_hist"])
+    open_p = to_float(live["open"])
+    high_p = to_float(live["high"], open_p)
+    low_p = to_float(live["low"], open_p)
+    close_p = to_float(live["close"], open_p)
+    ema9 = to_float(live["EMA9"], close_p)
+    ema21 = to_float(live["EMA21"], close_p)
+    vol = to_float(live["volume"])
+    vol_avg = to_float(live["VOL_AVG"], 1.0)
 
+    diff_usd = close_p - open_p
+    diff_pct = (diff_usd / open_p * 100.0) if open_p > 0 else 0.0
+    candle_range = max(high_p - low_p, 1e-9)
+
+    # Presión de cierre según posición dentro del rango high-low y cambio vs apertura
+    pos_in_range = (close_p - low_p) / candle_range  # 0.0 (mínimo) a 1.0 (máximo)
+    bull_pressure = int(np.clip(round(pos_in_range * 100.0), 0, 100))
+    bear_pressure = 100 - bull_pressure
+
+    # Retroceso intravela: cuánto ha retrocedido desde el máximo o mínimo de la vela
+    pullback_up_pct = int(np.clip(round(((high_p - close_p) / candle_range) * 100.0), 0, 100))
+    pullback_down_pct = int(np.clip(round(((close_p - low_p) / candle_range) * 100.0), 0, 100))
+
+    move_pct = abs(diff_pct)
     vol_ratio = (vol / vol_avg) if vol_avg > 0 else 0.0
     spread_pct = (abs(ema9 - ema21) / close_p * 100.0) if close_p > 0 else 0.0
 
-    is_flat = spread_pct < FLAT_SPREAD_PCT
-    spread_ok = spread_pct >= MIN_SPREAD_PCT
-
-    bull = [
-        close_p > ema9 > ema21,
-        spread_ok,
-        54.0 <= rsi <= 78.0,
-        hist > 0.0 and hist >= prev_hist * 0.85,
-        vol_ratio >= MIN_VOL_RATIO,
-    ]
-    bear = [
-        close_p < ema9 < ema21,
-        spread_ok,
-        22.0 <= rsi <= 46.0,
-        hist < 0.0 and hist <= prev_hist * 0.85,
-        vol_ratio >= MIN_VOL_RATIO,
-    ]
-
-    up_score = sum(int(x) for x in bull)
-    down_score = sum(int(x) for x in bear)
-    up_pct = int(round((up_score / 5.0) * 100))
-    down_pct = int(round((down_score / 5.0) * 100))
-
-    if up_score >= 4 and up_score > down_score:
-        signal = "UP"
-        reason = f"Señal alcista sólida ({up_score}/5 filtros · {up_pct}%) | Vol {vol_ratio:.2f}x | Spread {spread_pct:.3f}%."
-    elif down_score >= 4 and down_score > up_score:
-        signal = "DOWN"
-        reason = f"Señal bajista sólida ({down_score}/5 filtros · {down_pct}%) | Vol {vol_ratio:.2f}x | Spread {spread_pct:.3f}%."
-    elif not is_flat and up_score == 3 and down_score <= 1:
-        signal = "IMPULSO ALCISTA (3/5)"
-        reason = f"Presión alcista moderada ({up_score}/5 filtros · {up_pct}%) | Vol {vol_ratio:.2f}x | Spread {spread_pct:.3f}%."
-    elif not is_flat and down_score == 3 and up_score <= 1:
-        signal = "IMPULSO BAJISTA (3/5)"
-        reason = f"Presión bajista moderada ({down_score}/5 filtros · {down_pct}%) | Vol {vol_ratio:.2f}x | Spread {spread_pct:.3f}%."
+    # Decisión del sistema evitando atascos en lateral pero sin inventar señales sin desplazamiento
+    if move_pct < 0.025 and spread_pct < 0.015:
+        decision = "LATERAL · NO OPERAR"
+        status_type = "warning"
+        detail = (
+            "Sin una dirección técnica y desplazamiento verificable en la vela actual; "
+            "esperando mayor movimiento desde apertura."
+        )
+        bias = "NEUTRO"
+    elif close_p > open_p and bull_pressure >= 65 and move_pct >= 0.05:
+        decision = "UP · SESGO ALCISTA"
+        status_type = "success"
+        detail = f"Impulso alcista activo (+{diff_pct:.3f}%) con presión compradora del {bull_pressure}%."
+        bias = "ALCISTA"
+    elif close_p < open_p and bear_pressure >= 65 and move_pct >= 0.05:
+        decision = "DOWN · SESGO BAJISTA"
+        status_type = "error"
+        detail = f"Impulso bajista activo ({diff_pct:.3f}%) con presión vendedora del {bear_pressure}%."
+        bias = "BAJISTA"
+    elif close_p < open_p and bear_pressure >= 55:
+        decision = "POSIBLE SESGO BAJISTA"
+        status_type = "info"
+        detail = f"Presión bajista moderada ({bear_pressure}%) | Variación {diff_pct:+.3f}% | Vol {vol_ratio:.2f}x."
+        bias = "POSIBLE SESGO BAJISTA"
+    elif close_p > open_p and bull_pressure >= 55:
+        decision = "POSIBLE SESGO ALCISTA"
+        status_type = "info"
+        detail = f"Presión alcista moderada ({bull_pressure}%) | Variación {diff_pct:+.3f}% | Vol {vol_ratio:.2f}x."
+        bias = "POSIBLE SESGO ALCISTA"
     else:
-        signal = "LATERAL / NO OPERAR"
-        if is_flat:
-            reason = f"Mercado plano: EMA 9 y EMA 21 muy cercanas ({spread_pct:.3f}% < {FLAT_SPREAD_PCT:.3f}%)."
-        else:
-            reason = f"Sin ventaja clara ({up_score}/5 alcista vs {down_score}/5 bajista) | Vol {vol_ratio:.2f}x."
+        decision = "LATERAL · NO OPERAR"
+        status_type = "warning"
+        detail = "Lectura mixta o desplazamiento insuficiente para confirmar entrada."
+        bias = "NEUTRO"
+
+    # Preaviso temprano (barrido y recuperación de mecha/rango)
+    swept_low = low_p < to_float(prev_closed["low"], low_p) and close_p > open_p
+    swept_high = high_p > to_float(prev_closed["high"], high_p) and close_p < open_p
+
+    if swept_low and bull_pressure >= 60:
+        prealert = "🟢 PREALERTA ALCISTA: Barrido de mínimos con recuperación intravela."
+    elif swept_high and bear_pressure >= 60:
+        prealert = "🔴 PREALERTA BAJISTA: Barrido de máximos con rechazo intravela."
+    else:
+        prealert = "Sin prealerta temprana activa — aún no hay barrido y recuperación intravela con criterios suficientes."
+
+    now_utc = pd.Timestamp.utcnow()
+    close_ms = int(to_float(live["close_time_ms"], int(now_utc.timestamp() * 1000) + 300_000))
+    now_ms = int(now_utc.timestamp() * 1000)
+    secs_left = max(1, min(300, int((close_ms - now_ms) // 1000)))
+    countdown = f"{secs_left // 60:02d}:{secs_left % 60:02d}"
+    updated_str = now_utc.tz_convert("America/Caracas").strftime("%I:%M:%S %p")
 
     return {
-        "signal": signal,
-        "reason": reason,
-        "up_score": up_score,
-        "down_score": down_score,
-        "up_pct": up_pct,
-        "down_pct": down_pct,
+        "live_price": close_p,
+        "open_price": open_p,
+        "diff_usd": diff_usd,
+        "diff_pct": diff_pct,
+        "countdown": countdown,
+        "updated_str": updated_str,
+        "decision": decision,
+        "status_type": status_type,
+        "detail": detail,
+        "bull_pressure": bull_pressure,
+        "bear_pressure": bear_pressure,
+        "pullback_up_pct": pullback_up_pct,
+        "pullback_down_pct": pullback_down_pct,
+        "prealert": prealert,
+        "bias": bias,
         "vol_ratio": vol_ratio,
-        "rsi": rsi,
-        "close": close_p,
+        "ema9": ema9,
+        "ema21": ema21,
     }
 
 
-def radar_actual(curr, prev):
-    c_close = to_float(curr["close"])
-    c_ema9 = to_float(curr["EMA9"], c_close)
-    p_ema9 = to_float(prev["EMA9"], c_ema9)
-    c_rsi = to_float(curr["RSI"], 50.0)
-    c_hist = to_float(curr["MACD_hist"])
-    p_hist = to_float(prev["MACD_hist"])
-    c_vol = to_float(curr["volume"])
-    c_vavg = to_float(curr["VOL_AVG"])
-    v_ratio = (c_vol / c_vavg) if c_vavg > 0 else 0.0
-
-    bull = [
-        c_close > c_ema9 and c_ema9 >= p_ema9,
-        c_rsi >= 53.0,
-        c_hist > p_hist,
-        v_ratio >= 1.0,
-    ]
-    bear = [
-        c_close < c_ema9 and c_ema9 <= p_ema9,
-        c_rsi <= 47.0,
-        c_hist < p_hist,
-        v_ratio >= 1.0,
-    ]
-
-    up_s = sum(int(x) for x in bull)
-    down_s = sum(int(x) for x in bear)
-    return up_s, down_s, int(round(up_s / 4.0 * 100)), int(round(down_s / 4.0 * 100))
-
-
-@st.cache_data(ttl=30, show_spinner=False)
-def run_backtest(data, lookback=250):
-    if data is None or len(data) < 40:
-        return {"total": 0, "wins": 0, "losses": 0, "winrate": 0.0, "rows": []}
-
-    start = max(25, len(data) - lookback - 2)
-    end = len(data) - 2
-
-    wins = 0
-    losses = 0
-    rows = []
-
-    for i in range(start, end):
-        info = score_candle(data.iloc[i], data.iloc[i - 1])
-        sig = info["signal"]
-        direction = None
-        if sig in ("UP", "IMPULSO ALCISTA (3/5)"):
-            direction = "UP"
-        elif sig in ("DOWN", "IMPULSO BAJISTA (3/5)"):
-            direction = "DOWN"
-
-        if direction:
-            nxt = data.iloc[i + 1]
-            n_open = to_float(nxt["open"])
-            n_close = to_float(nxt["close"])
-            won = (direction == "UP" and n_close > n_open) or (direction == "DOWN" and n_close < n_open)
-            if won:
-                wins += 1
-            else:
-                losses += 1
-
-            rows.append({
-                "Señal": sig,
-                "Resultado": "ACIERTO" if won else "FALLO",
-                "Volumen": f"{info['vol_ratio']:.2f}x",
-                "RSI": f"{info['rsi']:.1f}",
-                "Cierre Vela": f"${info['close']:,.2f}",
-            })
-
-    total = wins + losses
-    winrate = (wins / total * 100.0) if total > 0 else 0.0
-    return {
-        "total": total,
-        "wins": wins,
-        "losses": losses,
-        "winrate": winrate,
-        "rows": list(reversed(rows[-10:])),
-    }
-
-
-st.title("₿ BTC/USDT PREDICTOR PRO")
-st.caption("ANÁLISIS TÉCNICO EN VIVO · TEMPORALIDAD 5 MINUTOS")
-
-
-@st.fragment(run_every="3s")
-def dashboard():
+def render_timeframe_view(tf_label, interval):
     try:
-        raw_df = fetch_klines("BTCUSDT", "5m", 350)
-        data = add_indicators(raw_df)
+        df = fetch_klines("BTCUSDT", interval=interval, limit=120)
+        info = analyze_intracandle(df)
+    except Exception as exc:
+        st.warning(f"Reconectando ({tf_label})... {exc}")
+        return
+
+    sign = "+" if info["diff_usd"] >= 0 else ""
+    st.metric(
+        f"BTC / USDT ({tf_label})",
+        f"${info['live_price']:,.2f}",
+        f"{sign}${info['diff_usd']:,.2f} ({sign}{info['diff_pct']:.3f}%)",
+    )
+    st.write(f"**Estado:** {info['decision']}  |  **Volumen relativo:** {info['vol_ratio']:.2f}x")
+    st.caption(info["detail"])
+
+
+st.title("₿ BTC / USDT · PANEL PRO")
+st.caption("LECTURA INTRAVELA EN TIEMPO REAL · SINCRONIZADO CON BINANCE")
+
+tab_pro, tab_15m, tab_1h, tab_radar = st.tabs(["Panel Pro (5M)", "15M", "1H", "Radar Max"])
+
+
+@st.fragment(run_every="2s")
+def live_panel_pro():
+    try:
+        df_5m = fetch_klines("BTCUSDT", interval="5m", limit=250)
+        info = analyze_intracandle(df_5m)
     except Exception as exc:
         st.warning(f"Reconectando con Binance... ({exc})")
         return
 
-    closed_candle = data.iloc[-2]
-    prev_closed = data.iloc[-3]
-    live_candle = data.iloc[-1]
+    sign = "+" if info["diff_usd"] >= 0 else ""
+    is_new_candle = info["countdown"] >= "04:40"
 
-    info = score_candle(closed_candle, prev_closed)
-    early_up, early_down, early_up_pct, early_down_pct = radar_actual(live_candle, closed_candle)
-
-    now_ms = int(pd.Timestamp.utcnow().timestamp() * 1000)
-    close_ms = int(to_float(live_candle["close_time_ms"], now_ms + 300_000))
-    segs_left = max(1, min(300, int((close_ms - now_ms) // 1000)))
-    countdown = f"{segs_left // 60:02d}:{segs_left % 60:02d}"
-
-    st.subheader("PRECIO BTC / USDT")
+    st.markdown("### PRECIO BTC / USDT")
     p1, p2 = st.columns(2)
-    p1.metric("PRECIO EN VIVO", f"${to_float(live_candle['close']):,.2f} USDT")
-    p2.metric("CIERRE DE VELA 5M", countdown)
+    with p1:
+        st.metric("PRECIO EN VIVO", f"${info['live_price']:,.2f} USDT")
+        st.caption(f"Apertura 5M: **${info['open_price']:,.2f}** · {sign}${info['diff_usd']:,.2f} ({sign}{info['diff_pct']:.3f}%)")
+    with p2:
+        st.metric("CIERRE VELA 5M", info["countdown"])
+        st.caption(f"{'Vela nueva · ' if is_new_candle else ''}Actualizado {info['updated_str']}")
 
     st.divider()
-    st.subheader("DECISIÓN DEL SISTEMA · 5M")
+    st.markdown("### DECISIÓN DEL SISTEMA · 5M")
 
-    sig = info["signal"]
-    if sig == "UP":
-        st.success(f"🟢 {sig}")
-    elif sig == "DOWN":
-        st.error(f"🔴 {sig}")
-    elif "ALCISTA" in sig:
-        st.info(f"🔵 {sig}")
-    elif "BAJISTA" in sig:
-        st.info(f"🟠 {sig}")
+    if info["status_type"] == "success":
+        st.success(f"🟢 {info['decision']}")
+    elif info["status_type"] == "error":
+        st.error(f"🔴 {info['decision']}")
+    elif info["status_type"] == "info":
+        st.info(f"🔵 {info['decision']}")
     else:
-        st.warning(f"🟡 {sig}")
+        st.warning(f"🟡 {info['decision']}")
 
-    st.caption(info["reason"])
+    st.caption(info["detail"])
 
-    c1, c2 = st.columns(2)
-    c1.metric("PRESIÓN ALCISTA (CONFIRMADA)", f"{info['up_pct']}%", f"{info['up_score']}/5 filtros")
-    c2.metric("PRESIÓN BAJISTA (CONFIRMADA)", f"{info['down_pct']}%", f"{info['down_score']}/5 filtros")
+    col_left, col_right = st.columns(2)
+    with col_left:
+        st.markdown("**PRESIÓN DE CIERRE**")
+        st.caption("PRESIÓN DE CIERRE ALCISTA / BAJISTA")
+        st.write(f"Alcista: **{info['bull_pressure']}%**")
+        st.progress(info["bull_pressure"] / 100.0)
+        st.write(f"Bajista: **{info['bear_pressure']}%**")
+        st.progress(info["bear_pressure"] / 100.0)
 
-    st.markdown("### RADAR ANTICIPADO · 2 MINUTOS")
-    if segs_left <= 120:
-        if early_up >= 3 and early_up > early_down:
-            st.success(f"🟢 PREALERTA SUBIDA ({early_up_pct}% · {early_up}/4)")
-        elif early_down >= 3 and early_down > early_up:
-            st.error(f"🔴 PREALERTA BAJADA ({early_down_pct}% · {early_down}/4)")
-        elif early_up == 2:
-            st.info(f"👀 VIGILANCIA ALCISTA ({early_up_pct}% · {early_up}/4)")
-        elif early_down == 2:
-            st.info(f"👀 VIGILANCIA BAJISTA ({early_down_pct}% · {early_down}/4)")
-        else:
-            st.warning("SIN PREALERTA: ESPERANDO CONFIRMACIÓN")
-    else:
-        st.info("⏳ El radar anticipado se activa en los últimos 2 minutos del cierre de vela de 5m.")
+    with col_right:
+        st.markdown("**RETROCESO INTRAVELA**")
+        st.caption("DESPLAZAMIENTO RESPECTO A EXTREMOS DE VELA")
+        st.write(f"Al alza (margen hasta máximo): **{info['pullback_up_pct']}%**")
+        st.progress(info["pullback_up_pct"] / 100.0)
+        st.write(f"A la baja (margen desde mínimo): **{info['pullback_down_pct']}%**")
+        st.progress(info["pullback_down_pct"] / 100.0)
 
-    st.markdown("### HISTORIAL DE SEÑALES · ÚLTIMAS 250 VELAS (5M)")
-    bt = run_backtest(data, lookback=250)
+    st.markdown("### PREAVISO 5M · ANTES DE CONFIRMAR")
+    st.info(info["prealert"])
 
-    h1, h2, h3 = st.columns(3)
-    h1.metric("% ACIERTO HISTÓRICO", f"{bt['winrate']:.1f}%")
-    h2.metric("ACIERTOS / FALLOS", f"{bt['wins']} / {bt['losses']}")
-    h3.metric("SEÑALES EMITIDAS", f"{bt['total']}")
-
-    if bt["rows"]:
-        st.dataframe(bt["rows"], width="stretch", hide_index=True)
-    else:
-        st.caption("Sin señales registradas en el tramo evaluado.")
+    st.markdown("### SESGO DIRECCIONAL")
+    st.subheader(f"POSIBLE SESGO: {info['bias']}")
 
 
-dashboard()
+with tab_pro:
+    live_panel_pro()
+
+with tab_15m:
+    render_timeframe_view("15M", "15m")
+
+with tab_1h:
+    render_timeframe_view("1H", "1h")
+
+with tab_radar:
+    st.subheader("RADAR MAX · RESUMEN MULTITEMPORAL")
+    c_a, c_b, c_c = st.columns(3)
+    with c_a:
+        render_timeframe_view("5M", "5m")
+    with c_b:
+        render_timeframe_view("15M", "15m")
+    with c_c:
+        render_timeframe_view("1H", "1h")
