@@ -11,13 +11,38 @@ st.set_page_config(
 )
 
 
-@st.cache_data(ttl=2)
+@st.cache_data(ttl=3)
 def fetch_klines(symbol="BTCUSDT", interval="5m", limit=350):
-    url = "https://api.binance.com/api/v3/klines"
+    endpoints = [
+        "https://data-api.binance.vision/api/v3/klines",
+        "https://api1.binance.com/api/v3/klines",
+        "https://api2.binance.com/api/v3/klines",
+        "https://api3.binance.com/api/v3/klines",
+        "https://api4.binance.com/api/v3/klines",
+        "https://api.binance.com/api/v3/klines",
+    ]
+    headers = {"User-Agent": "Mozilla/5.0"}
     params = {"symbol": symbol, "interval": interval, "limit": limit}
-    response = requests.get(url, params=params, timeout=10)
-    response.raise_for_status()
-    raw = response.json()
+
+    last_error = None
+    raw = None
+
+    for url in endpoints:
+        try:
+            response = requests.get(url, params=params, headers=headers, timeout=10)
+            if response.status_code == 451:
+                last_error = f"451 en {url}"
+                continue
+            response.raise_for_status()
+            raw = response.json()
+            if isinstance(raw, list) and len(raw) > 0:
+                break
+        except Exception as exc:
+            last_error = f"{url}: {exc}"
+            continue
+
+    if raw is None:
+        raise RuntimeError(f"Sin acceso a velas desde la nube ({last_error})")
 
     cols = [
         "open_time", "open", "high", "low", "close", "volume",
