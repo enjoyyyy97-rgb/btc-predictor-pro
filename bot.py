@@ -23,7 +23,7 @@ import urllib.error
 SYMBOL = "BTCUSDT"
 INTERVAL = "5m"      # cambia a 5m, 15m o 1h si quieres
 LIMIT = 100
-REFRESH_SEG = 60
+REFRESH_SEG = 3
 
 # Kraken funciona en casi todos los países sin bloqueo. Binance como respaldo.
 KRAKEN_INTERVAL = {"5m": 5, "15m": 15, "1h": 60, "4h": 240, "1d": 1440}
